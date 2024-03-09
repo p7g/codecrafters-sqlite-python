@@ -103,13 +103,10 @@ def parse_varint(buf, offset=0):
     n = 0
     for i in range(offset, offset + 9):
         byte = buf[i]
+        n <<= 7
+        n |= byte & 0x7f
         if byte & 0x80 == 0:
-            n <<= 8
-            n |= byte
             break
-        else:
-            n <<= 7
-            n |= byte & 0x7F
     else:
         i = -1
     return n, i + 1 - offset
