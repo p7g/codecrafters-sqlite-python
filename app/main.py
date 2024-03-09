@@ -155,7 +155,12 @@ def parse_record(buf, offset, text_encoding):
             offset += value_len
         elif column_serial_type >= 13 and column_serial_type % 2 == 1:
             value_len = (column_serial_type - 13) // 2
-            column_values.append(buf[offset : offset + value_len].decode(text_encoding))
+            blob_value = buf[offset : offset + value_len]
+            try:
+                column_values.append(blob_value.decode(text_encoding))
+            except UnicodeDecodeError:
+                # FIXME: why does this happen?
+                column_values.append(blob_value)
             offset += value_len
         else:
             raise NotImplementedError(column_serial_type)
