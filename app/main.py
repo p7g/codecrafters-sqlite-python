@@ -25,7 +25,9 @@ def main():
             page_size = int.from_bytes(database_file.read(2), byteorder="big")
 
             database_file.seek(56)
-            text_encoding = ["utf-8", "utf-16-le", "utf-16-be"][int.from_bytes(database_file.read(4), byteorder="big") - 1]
+            text_encoding = ["utf-8", "utf-16-le", "utf-16-be"][
+                int.from_bytes(database_file.read(4), byteorder="big") - 1
+            ]
 
             database_file.seek(0)
             page = database_file.read(page_size)
@@ -34,7 +36,7 @@ def main():
             btree_offset = 100 + bytes_read
             cells = []
             for i in range(btree_header.cell_count):
-                cell_content_offset, = struct.unpack_from(">H", page, btree_offset)
+                (cell_content_offset,) = struct.unpack_from(">H", page, btree_offset)
                 btree_offset += 2
 
                 _payload_size, bytes_read = parse_varint(page, cell_content_offset)
@@ -43,7 +45,9 @@ def main():
                 rowid, bytes_read = parse_varint(page, cell_content_offset)
                 cell_content_offset += bytes_read
 
-                column_values, bytes_read = parse_record(page, cell_content_offset, text_encoding)
+                column_values, bytes_read = parse_record(
+                    page, cell_content_offset, text_encoding
+                )
 
                 # ???
                 # assert bytes_read == payload_size, (bytes_read, payload_size)
@@ -51,7 +55,13 @@ def main():
                 column_values.insert(0, rowid)
                 cells.append(column_values)
 
-            print(" ".join(cell[2] for cell in cells))
+            print(
+                " ".join(
+                    cell[3]
+                    for cell in cells
+                    if cell[1] == "table" and not cell[3].startswith("sqlite_")
+                )
+            )
     else:
         print(f"Invalid command: {command}")
 
@@ -135,7 +145,9 @@ def parse_record(buf, offset, text_encoding):
                 if column_serial_type == 5
                 else 8
             )
-            value = int.from_bytes(buf[offset:offset + number_byte_size], byteorder="big", signed=True)
+            value = int.from_bytes(
+                buf[offset : offset + number_byte_size], byteorder="big", signed=True
+            )
             column_values.append(value)
             offset += number_byte_size
         elif column_serial_type == 7:
@@ -146,11 +158,11 @@ def parse_record(buf, offset, text_encoding):
             column_values.append(int(column_serial_type == 9))
         elif column_serial_type >= 12 and column_serial_type % 2 == 0:
             value_len = (column_serial_type - 12) // 2
-            column_values.append(buf[offset:offset + value_len])
+            column_values.append(buf[offset : offset + value_len])
             offset += value_len
         elif column_serial_type >= 13 and column_serial_type % 2 == 1:
             value_len = (column_serial_type - 13) // 2
-            column_values.append(buf[offset:offset + value_len].decode(text_encoding))
+            column_values.append(buf[offset : offset + value_len].decode(text_encoding))
             offset += value_len
         else:
             raise NotImplementedError(column_serial_type)
