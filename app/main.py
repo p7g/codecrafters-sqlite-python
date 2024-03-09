@@ -7,11 +7,16 @@ def main():
     database_file_path = sys.argv[1]
     command = sys.argv[2]
 
-    if command == ".dbinfo":
-        with open(database_file_path, "rb") as database_file:
-            database_file.seek(16)  # Skip the first 16 bytes of the header
-            page_size = int.from_bytes(database_file.read(2), byteorder="big")
+    with open(database_file_path, "rb") as database_file:
+        database_file.seek(16)  # Skip the first 16 bytes of the header
+        page_size = int.from_bytes(database_file.read(2), byteorder="big")
 
+        database_file.seek(56)
+        text_encoding = ["utf-8", "utf-16-le", "utf-16-be"][
+            int.from_bytes(database_file.read(4), byteorder="big") - 1
+        ]
+
+        if command == ".dbinfo":
             print(f"database page size: {page_size}")
 
             database_file.seek(0)
@@ -19,51 +24,39 @@ def main():
             btree_header = parse_btree_header(page, is_first_page=True)[0]
             print(f"number of tables: {btree_header.cell_count}")
 
-    elif command == ".tables":
-        with open(database_file_path, "rb") as database_file:
-            database_file.seek(16)  # Skip the first 16 bytes of the header
-            page_size = int.from_bytes(database_file.read(2), byteorder="big")
-
-            database_file.seek(56)
-            text_encoding = ["utf-8", "utf-16-le", "utf-16-be"][
-                int.from_bytes(database_file.read(4), byteorder="big") - 1
-            ]
-
-            database_file.seek(0)
-            page = database_file.read(page_size)
-            btree_header, bytes_read = parse_btree_header(page, is_first_page=True)
-
-            btree_offset = 100 + bytes_read
-            cells = []
-            for i in range(btree_header.cell_count):
-                (cell_content_offset,) = struct.unpack_from(">H", page, btree_offset)
-                btree_offset += 2
-
-                _payload_size, bytes_read = parse_varint(page, cell_content_offset)
-                cell_content_offset += bytes_read
-
-                rowid, bytes_read = parse_varint(page, cell_content_offset)
-                cell_content_offset += bytes_read
-
-                column_values, bytes_read = parse_record(
-                    page, cell_content_offset, text_encoding
-                )
-
-                # ???
-                # assert bytes_read == payload_size, (bytes_read, payload_size)
-
-                column_values.insert(0, rowid)
-                cells.append(column_values)
-
+        elif command == ".tables":
             print(
                 " ".join(
-                    cell[3]
-                    for cell in cells
-                    if cell[1] == "table" and not cell[3].startswith("sqlite_")
+                    row.tbl_name
+                    for row in select_all_from_sqlite_schema(database_file, page_size, text_encoding)
+                    if row.type == "table" and not row.tbl_name.startswith("sqlite_")
                 )
             )
-    else:
-        print(f"Invalid command: {command}")
+        else:
+            # Assume "SELECT COUNT(*) FROM <table>"
+            query = command
+            _rest, table_name = query.rsplit(None, 1)
+
+            if table_name in ("sqlite_schema", "sqlite_master", "sqlite_temp_schema", "sqlite_temp_master"):
+                rootpage = 1
+            else:
+                # FIXME: be more efficient
+                try:
+                    table_info = next(
+                        table_info
+                        for table_info in select_all_from_sqlite_schema(database_file, page_size, text_encoding)
+                        if table_info.type == "table" and table_info.tbl_name == table_name
+                    )
+                except StopIteration:
+                    print(f"Unknown table '{table_name}'", file=sys.stderr)
+                    return 1
+                rootpage = table_info.rootpage
+
+            page = get_page(database_file, rootpage, page_size)
+            btree_header = parse_btree_header(page, rootpage == 1)[0]
+            print(btree_header.cell_count)
+
+    return 0
 
 
 BTreeHeader = namedtuple(
@@ -170,5 +163,38 @@ def parse_record(buf, offset, text_encoding):
     return column_values, offset - initial_offset
 
 
+def get_page(file, id_, page_size):
+    file.seek((id_ - 1) * page_size)
+    return file.read(page_size)
+
+
+SqliteSchema = namedtuple("SqliteSchema", ["rowid", "type", "name", "tbl_name", "rootpage", "sql"])
+
+
+def select_all_from_sqlite_schema(file, page_size, text_encoding):
+    page = get_page(file, 1, page_size)
+    btree_header, bytes_read = parse_btree_header(page, is_first_page=True)
+
+    btree_offset = 100 + bytes_read
+    for i in range(btree_header.cell_count):
+        (cell_content_offset,) = struct.unpack_from(">H", page, btree_offset)
+        btree_offset += 2
+
+        _payload_size, bytes_read = parse_varint(page, cell_content_offset)
+        cell_content_offset += bytes_read
+
+        rowid, bytes_read = parse_varint(page, cell_content_offset)
+        cell_content_offset += bytes_read
+
+        column_values, bytes_read = parse_record(
+            page, cell_content_offset, text_encoding
+        )
+
+        # ???
+        # assert bytes_read == payload_size, (bytes_read, payload_size)
+
+        yield SqliteSchema(rowid, *column_values)
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
