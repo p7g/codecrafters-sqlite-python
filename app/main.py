@@ -18,6 +18,8 @@ def main():
             int.from_bytes(database_file.read(4), byteorder="big") - 1
         ]
 
+        db_config = DBConfig(page_size=page_size, text_encoding=text_encoding)
+
         if command == ".dbinfo":
             print(f"database page size: {page_size}")
 
@@ -31,7 +33,7 @@ def main():
                 " ".join(
                     row.tbl_name
                     for row in select_all_from_sqlite_schema(
-                        database_file, page_size, text_encoding
+                        database_file, db_config
                     )
                     if row.type == "table" and not row.tbl_name.startswith("sqlite_")
                 )
@@ -50,7 +52,7 @@ def main():
                 "sqlite_temp_schema".casefold(),
                 "sqlite_temp_master".casefold(),
             ):
-                table_info = SqliteSchema(
+                table_schema = SqliteSchema(
                     0,
                     "table",
                     "sqlite_schema",
@@ -67,10 +69,10 @@ def main():
             else:
                 # FIXME: be more efficient
                 try:
-                    table_info = next(
+                    table_schema = next(
                         table_info
                         for table_info in select_all_from_sqlite_schema(
-                            database_file, page_size, text_encoding
+                            database_file, db_config
                         )
                         if table_info.type == "table"
                         and table_info.tbl_name.casefold() == table_name.casefold()
@@ -79,9 +81,9 @@ def main():
                     print(f"Unknown table '{table_name}'", file=sys.stderr)
                     return 1
 
-            page = get_page(database_file, table_info.rootpage, page_size)
+            page = get_page(database_file, db_config, table_schema.rootpage)
             btree_header, bytes_read = parse_btree_header(
-                page, table_info.rootpage == 1
+                page, table_schema.rootpage == 1
             )
 
             if (
@@ -96,12 +98,28 @@ def main():
                 columns = [
                     tuple(column_spec.strip().split(None, 1))
                     for column_spec in (
-                        table_info.sql.split("(", 1)[1].rsplit(")", 1)[0].split(",")
+                        table_schema.sql.split("(", 1)[1].rsplit(")", 1)[0].split(",")
                     )
                 ]
                 column_order = {
                     name.casefold(): i for i, (name, _type) in enumerate(columns)
                 }
+
+                primary_key_column_idx = next(
+                    (
+                        column_index
+                        for column_index, (_name, type_) in enumerate(columns)
+                        if type_.casefold().split()[:3]
+                        == [
+                            "integer".casefold(),
+                            "primary".casefold(),
+                            "key".casefold(),
+                        ]
+                    ),
+                    None,
+                )
+
+                table_info = TableInfo(rootpage=table_schema.rootpage, int_pk_column=primary_key_column_idx)
 
                 try:
                     if len(stmt.selects) == 1 and isinstance(
@@ -118,35 +136,24 @@ def main():
                             column_order[name_expr.name.casefold()]
                             for name_expr in stmt.selects
                         ]
-
-                    primary_key_selected_column_idx = next(
-                        (
-                            selection_index
-                            for selection_index, column_index in enumerate(
-                                selected_columns
-                            )
-                            if columns[column_index][1].casefold().split()[:3]
-                            == [
-                                "integer".casefold(),
-                                "primary".casefold(),
-                                "key".casefold(),
-                            ]
-                        ),
-                        None,
-                    )
                 except KeyError as e:
                     print(f"Unknown column {e}", file=sys.stderr)
                     return 1
 
-                for rowid, column_values in read_table(
+                where = None
+                if stmt.where:
+                    where = (
+                        column_order[stmt.where.lhs.name.casefold()],
+                        stmt.where.rhs.text,
+                    )
+
+                for column_values in read_table(
                     database_file,
-                    table_info.rootpage,
-                    page_size,
-                    text_encoding,
+                    db_config,
+                    table_info,
                     selected_columns,
+                    where,
                 ):
-                    if primary_key_selected_column_idx is not None:
-                        column_values[primary_key_selected_column_idx] = rowid
                     print("|".join(str(val) for val in column_values))
 
     return 0
@@ -222,27 +229,30 @@ def size_for_type(serial_type):
         raise NotImplementedError(serial_type)
 
 
-def parse_record(buf, offset, text_encoding, columns):
+def parse_record(db_config, table_info, page, rowid, offset, selection):
     initial_offset = offset
-    header_size, bytes_read = parse_varint(buf, offset)
+    header_size, bytes_read = parse_varint(page, offset)
     header_end = offset + header_size
     offset += bytes_read
     column_types = []
     while offset != header_end:
-        column_serial_type, bytes_read = parse_varint(buf, offset)
+        column_serial_type, bytes_read = parse_varint(page, offset)
         column_types.append((column_serial_type, size_for_type(column_serial_type)))
         offset += bytes_read
 
-    column_selection = {column_id: order for order, column_id in enumerate(columns)}
+    column_selection = {column_id: order for order, column_id in enumerate(selection)}
 
     column_values: list = [None] * len(column_selection)
-    for i, (column_serial_type, size) in enumerate(column_types):
-        if i not in column_selection:
+    for column_id, (column_serial_type, size) in enumerate(column_types):
+        if column_id not in column_selection:
             offset += size
             continue
 
         if column_serial_type == 0:
-            continue  # None is already stored in column_values
+            if column_id == table_info.int_pk_column:
+                value = rowid
+            else:
+                continue  # None is already stored in column_values
         elif 1 <= column_serial_type <= 6:
             number_byte_size = (
                 column_serial_type
@@ -252,43 +262,47 @@ def parse_record(buf, offset, text_encoding, columns):
                 else 8
             )
             value = int.from_bytes(
-                buf[offset : offset + number_byte_size], byteorder="big", signed=True
+                page[offset : offset + number_byte_size], byteorder="big", signed=True
             )
         elif column_serial_type == 7:
-            value = struct.unpack_from(">d", buf, offset)
+            value = struct.unpack_from(">d", page, offset)
         elif column_serial_type in (8, 9):
             value = int(column_serial_type == 9)
         elif column_serial_type >= 12 and column_serial_type % 2 == 0:
             value_len = (column_serial_type - 12) // 2
-            value = buf[offset : offset + value_len]
+            value = page[offset : offset + value_len]
         elif column_serial_type >= 13 and column_serial_type % 2 == 1:
             value_len = (column_serial_type - 13) // 2
-            blob_value = buf[offset : offset + value_len]
+            blob_value = page[offset : offset + value_len]
             try:
-                value = blob_value.decode(text_encoding)
+                value = blob_value.decode(db_config.text_encoding)
             except UnicodeDecodeError:
                 # FIXME: why does this happen?
                 value = blob_value
         else:
             raise NotImplementedError(column_serial_type)
 
-        column_values[column_selection[i]] = value
+        column_values[column_selection[column_id]] = value
         offset += size
 
     return column_values, offset - initial_offset
 
 
-def get_page(file, id_, page_size):
-    file.seek((id_ - 1) * page_size)
-    return file.read(page_size)
+DBConfig = namedtuple("DBConfig", "page_size,text_encoding")
+TableInfo = namedtuple("TableInfo", "rootpage,int_pk_column")
 
 
-def read_table(file, rootpage, page_size, text_encoding, columns):
-    page = get_page(file, rootpage, page_size)
-    btree_header, bytes_read = parse_btree_header(page, is_first_page=rootpage == 1)
+def get_page(file, db_config, id_):
+    file.seek((id_ - 1) * db_config.page_size)
+    return file.read(db_config.page_size)
+
+
+def read_table(file, db_config, table_info, selection, where):
+    page = get_page(file, db_config, table_info.rootpage)
+    btree_header, bytes_read = parse_btree_header(page, is_first_page=table_info.rootpage == 1)
 
     btree_offset = bytes_read
-    if rootpage == 1:
+    if table_info.rootpage == 1:
         btree_offset += 100
 
     for _i in range(btree_header.cell_count):
@@ -302,25 +316,27 @@ def read_table(file, rootpage, page_size, text_encoding, columns):
         cell_content_offset += bytes_read
 
         column_values, bytes_read = parse_record(
-            page, cell_content_offset, text_encoding, columns
+            db_config, table_info, page, rowid, cell_content_offset, selection
         )
+        if where and column_values[where[0]] != where[1]:
+            continue
 
         # ???
         # assert bytes_read == payload_size, (bytes_read, payload_size)
 
-        yield (rowid, column_values)
+        yield column_values
 
 
 SqliteSchema = namedtuple(
-    "SqliteSchema", ["rowid", "type", "name", "tbl_name", "rootpage", "sql"]
+    "SqliteSchema", ["type", "name", "tbl_name", "rootpage", "sql"]
 )
 
 
-def select_all_from_sqlite_schema(file, page_size, text_encoding):
-    for rowid, column_values in read_table(
-        file, 1, page_size, text_encoding, list(range(5))
+def select_all_from_sqlite_schema(file, db_config):
+    for column_values in read_table(
+        file, db_config, TableInfo(1, None), list(range(5)), None
     ):
-        yield SqliteSchema(rowid, *column_values)
+        yield SqliteSchema(*column_values)
 
 
 if __name__ == "__main__":

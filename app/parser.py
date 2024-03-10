@@ -39,11 +39,13 @@ _one_char_tokens = {
     ")": "RPAREN",
     ";": "SEMICOLON",
     "*": "STAR",
+    "=": "EQUAL",
 }
 
 _keywords = {
     "SELECT".casefold(): "SELECT",
     "FROM".casefold(): "FROM",
+    "WHERE".casefold(): "WHERE",
 }
 
 
@@ -65,6 +67,20 @@ def _scan(it):
                 yield Token(_keywords[name.casefold()], name)
             else:
                 yield Token("NAME", name)
+        elif c == "'":
+            str_content = ""
+            while True:
+                c = next(it, None)
+                if c is None:
+                    raise ParseError("Unterminated string literal")
+                if c == "'":
+                    if it.peek() == "'":
+                        str_content += "'"
+                    else:
+                        break
+                else:
+                    str_content += c
+            yield Token("STRING", str_content)
         else:
             raise ParseError(f"Unexpected token {c!r}")
 
@@ -73,10 +89,12 @@ def parse(text):
     yield from _parse(_peekable(scan(text)))
 
 
-SelectStmt = namedtuple("SelectStmt", "selects,from_table")
+SelectStmt = namedtuple("SelectStmt", "selects,from_table,where")
 FunctionExpr = namedtuple("FunctionExpr", "name,args")
 NameExpr = namedtuple("NameExpr", "name")
 StarExpr = namedtuple("StarExpr", "")
+BinaryExpr = namedtuple("BinaryExpr", "op,lhs,rhs")
+StringExpr = namedtuple("StringExpr", "text")
 
 
 def _parse(it):
@@ -116,11 +134,27 @@ def _parse_select_stmt(it):
     if from_table.type != "NAME":
         raise ParseError(f"Expected name, got {from_table.text!r}")
 
-    semicolon = next(it, None)
-    if semicolon is not None and semicolon.type != "SEMICOLON":
-        raise ParseError(f"Expected end of input or semicolon, got {semicolon!r}")
+    tok = next(it, None)
+    where = None
+    if tok and tok.type == "WHERE":
+        # FIXME: proper expression parsing
+        lhs = next(it, None)
+        op = next(it, None)
+        rhs = next(it, None)
+        if (
+            lhs is None
+            or op is None
+            or rhs is None
+            or lhs.type != "NAME"
+            or op.type != "EQUAL"
+            or rhs.type != "STRING"
+        ):
+            raise ParseError("Unsupported WHERE clause")
+        where = BinaryExpr(op.type, NameExpr(lhs.text), StringExpr(rhs.text))
+    elif tok and tok.type != "SEMICOLON":
+        raise ParseError(f"Expected end of input or semicolon, got {tok.text!r}")
 
-    return SelectStmt(selects, from_table.text)
+    return SelectStmt(selects, from_table.text, where)
 
 
 def _parse_selection(it):
