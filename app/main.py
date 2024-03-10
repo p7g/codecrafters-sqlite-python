@@ -53,7 +53,6 @@ def main():
                 "sqlite_temp_master".casefold(),
             ):
                 table_schema = SqliteSchema(
-                    0,
                     "table",
                     "sqlite_schema",
                     "sqlite_schema",
@@ -86,74 +85,75 @@ def main():
                 page, table_schema.rootpage == 1
             )
 
-            if (
+            create_table_ast = next(parser.parse(table_schema.sql))
+            assert isinstance(create_table_ast, parser.CreateTableStmt)
+
+            column_order = {
+                name.casefold(): i for i, (name, _type) in enumerate(create_table_ast.columns)
+            }
+
+            primary_key_column_idx = next(
+                (
+                    column_index
+                    for column_index, column in enumerate(create_table_ast.columns)
+                    if column.type.casefold().startswith("integer primary key".casefold())
+                ),
+                None,
+            )
+
+            table_info = TableInfo(rootpage=table_schema.rootpage, int_pk_column=primary_key_column_idx)
+
+            is_count_star = (
                 len(stmt.selects) == 1
                 and isinstance(stmt.selects[0], parser.FunctionExpr)
                 and stmt.selects[0].name == "COUNT"
                 and len(stmt.selects[0].args) == 1
                 and isinstance(stmt.selects[0].args[0], parser.StarExpr)
-            ):
-                print(btree_header.cell_count)
-            else:
-                columns = [
-                    tuple(column_spec.strip().split(None, 1))
-                    for column_spec in (
-                        table_schema.sql.split("(", 1)[1].rsplit(")", 1)[0].split(",")
-                    )
-                ]
-                column_order = {
-                    name.casefold(): i for i, (name, _type) in enumerate(columns)
-                }
+            )
 
-                primary_key_column_idx = next(
-                    (
-                        column_index
-                        for column_index, (_name, type_) in enumerate(columns)
-                        if type_.casefold().split()[:3]
-                        == [
-                            "integer".casefold(),
-                            "primary".casefold(),
-                            "key".casefold(),
-                        ]
-                    ),
-                    None,
+            try:
+                if len(stmt.selects) == 1 and isinstance(
+                    stmt.selects[0], parser.StarExpr
+                ):
+                    selected_columns = list(range(len(column_order)))
+                elif is_count_star:
+                    selected_columns = []
+                elif not all(
+                    isinstance(select, parser.NameExpr) for select in stmt.selects
+                ):
+                    print("Only simple queries are supported", file=sys.stderr)
+                    return 1
+                else:
+                    selected_columns = [
+                        column_order[name_expr.name.casefold()]
+                        for name_expr in stmt.selects
+                    ]
+            except KeyError as e:
+                print(f"Unknown column {e}", file=sys.stderr)
+                return 1
+
+            where = None
+            if stmt.where:
+                where = (
+                    column_order[stmt.where.lhs.name.casefold()],
+                    stmt.where.rhs.text,
                 )
 
-                table_info = TableInfo(rootpage=table_schema.rootpage, int_pk_column=primary_key_column_idx)
+            rows = read_table(
+                database_file,
+                db_config,
+                table_info,
+                selected_columns,
+                where,
+            )
 
-                try:
-                    if len(stmt.selects) == 1 and isinstance(
-                        stmt.selects[0], parser.StarExpr
-                    ):
-                        selected_columns = list(range(len(column_order)))
-                    elif not all(
-                        isinstance(select, parser.NameExpr) for select in stmt.selects
-                    ):
-                        print("Only simple queries are supported", file=sys.stderr)
-                        return 1
-                    else:
-                        selected_columns = [
-                            column_order[name_expr.name.casefold()]
-                            for name_expr in stmt.selects
-                        ]
-                except KeyError as e:
-                    print(f"Unknown column {e}", file=sys.stderr)
-                    return 1
-
-                where = None
-                if stmt.where:
-                    where = (
-                        column_order[stmt.where.lhs.name.casefold()],
-                        stmt.where.rhs.text,
-                    )
-
-                for column_values in read_table(
-                    database_file,
-                    db_config,
-                    table_info,
-                    selected_columns,
-                    where,
-                ):
+            if is_count_star:
+                i = -1
+                for i, _ in enumerate(rows):
+                    pass
+                print(i + 1)
+            else:
+                for column_values in rows:
                     print("|".join(str(val) for val in column_values))
 
     return 0
@@ -255,7 +255,7 @@ def parse_record(db_config, table_info, page, rowid, offset, selection, where):
             if column_id == table_info.int_pk_column:
                 value = rowid
             else:
-                continue  # None is already stored in column_values
+                value = None
         elif 1 <= column_serial_type <= 6:
             number_byte_size = (
                 column_serial_type
@@ -288,7 +288,7 @@ def parse_record(db_config, table_info, page, rowid, offset, selection, where):
         offset += size
 
         if where and column_id == where[0] and value != where[1]:
-            return None, initial_offset + total_size
+            return None, total_size
 
         if column_id in column_selection:
             column_values[column_selection[column_id]] = value
@@ -307,6 +307,10 @@ def get_page(file, db_config, id_):
 
 def read_table(file, db_config, table_info, selection, where):
     page = get_page(file, db_config, table_info.rootpage)
+    yield from _read_table(file, db_config, table_info, page, selection, where)
+
+
+def _read_table(file, db_config, table_info, page, selection, where):
     btree_header, bytes_read = parse_btree_header(page, is_first_page=table_info.rootpage == 1)
 
     btree_offset = bytes_read
@@ -317,24 +321,32 @@ def read_table(file, db_config, table_info, selection, where):
         (cell_content_offset,) = struct.unpack_from(">H", page, btree_offset)
         btree_offset += 2
 
-        _payload_size, bytes_read = parse_varint(page, cell_content_offset)
-        cell_content_offset += bytes_read
+        if btree_header.type == BTREE_PAGE_INTERIOR_TABLE:
+            (left_ptr,) = struct.unpack_from(">I", page, cell_content_offset)
+            left_page = get_page(file, db_config, left_ptr)
+            yield from _read_table(file, db_config, table_info, left_page, selection, where)
+        else:
+            assert btree_header.type == BTREE_PAGE_LEAF_TABLE
+            payload_size, bytes_read = parse_varint(page, cell_content_offset)
+            cell_content_offset += bytes_read
 
-        rowid, bytes_read = parse_varint(page, cell_content_offset)
-        cell_content_offset += bytes_read
+            rowid, bytes_read = parse_varint(page, cell_content_offset)
+            cell_content_offset += bytes_read
 
-        column_values, bytes_read = parse_record(
-            db_config, table_info, page, rowid, cell_content_offset, selection, where
-        )
+            column_values, bytes_read = parse_record(
+                db_config, table_info, page, rowid, cell_content_offset, selection, where
+            )
+            assert bytes_read == payload_size, (bytes_read, payload_size)
 
-        # filtered out
-        if column_values is None:
-            continue
+            # filtered out
+            if column_values is None:
+                continue
 
-        # ???
-        # assert bytes_read == payload_size, (bytes_read, payload_size)
+            yield column_values
 
-        yield column_values
+    if btree_header.type == BTREE_PAGE_INTERIOR_TABLE:
+        rightmost_page = get_page(file, db_config, btree_header.rightmost_pointer)
+        yield from _read_table(file, db_config, table_info, rightmost_page, selection, where)
 
 
 SqliteSchema = namedtuple(
