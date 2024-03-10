@@ -229,22 +229,25 @@ def size_for_type(serial_type):
         raise NotImplementedError(serial_type)
 
 
-def parse_record(db_config, table_info, page, rowid, offset, selection):
+def parse_record(db_config, table_info, page, rowid, offset, selection, where):
     initial_offset = offset
     header_size, bytes_read = parse_varint(page, offset)
     header_end = offset + header_size
     offset += bytes_read
     column_types = []
+    total_size = header_size
     while offset != header_end:
         column_serial_type, bytes_read = parse_varint(page, offset)
-        column_types.append((column_serial_type, size_for_type(column_serial_type)))
+        column_size = size_for_type(column_serial_type)
+        column_types.append((column_serial_type, column_size))
         offset += bytes_read
+        total_size += column_size
 
     column_selection = {column_id: order for order, column_id in enumerate(selection)}
 
     column_values: list = [None] * len(column_selection)
     for column_id, (column_serial_type, size) in enumerate(column_types):
-        if column_id not in column_selection:
+        if column_id not in column_selection and (not where or column_id != where[0]):
             offset += size
             continue
 
@@ -282,8 +285,13 @@ def parse_record(db_config, table_info, page, rowid, offset, selection):
         else:
             raise NotImplementedError(column_serial_type)
 
-        column_values[column_selection[column_id]] = value
         offset += size
+
+        if where and column_id == where[0] and value != where[1]:
+            return None, initial_offset + total_size
+
+        if column_id in column_selection:
+            column_values[column_selection[column_id]] = value
 
     return column_values, offset - initial_offset
 
@@ -316,9 +324,11 @@ def read_table(file, db_config, table_info, selection, where):
         cell_content_offset += bytes_read
 
         column_values, bytes_read = parse_record(
-            db_config, table_info, page, rowid, cell_content_offset, selection
+            db_config, table_info, page, rowid, cell_content_offset, selection, where
         )
-        if where and column_values[where[0]] != where[1]:
+
+        # filtered out
+        if column_values is None:
             continue
 
         # ???
