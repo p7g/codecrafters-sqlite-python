@@ -2,7 +2,7 @@ import struct
 import sys
 from collections import namedtuple
 
-import sqlparse
+import app.parser as parser
 
 
 def main():
@@ -37,113 +37,117 @@ def main():
                 )
             )
         else:
-            for query in sqlparse.split(command):
-                tokens = query.strip().split()
+            stmt = next(parser.parse(command))
 
-                if tokens[0].casefold() != "SELECT".casefold():
-                    print("Only know select", file=sys.stderr)
-                    return 1
+            if not isinstance(stmt, parser.SelectStmt):
+                print("Only know select", file=sys.stderr)
+                return 1
 
-                selects = []
-                for i, token in enumerate(tokens[1:]):
-                    if token.casefold() == "FROM".casefold():
-                        break
-                    selects.append(token.rstrip(",").casefold())
-                else:
-                    print("Expected something after SELECT", file=sys.stderr)
-                    return 1
-
-                table_name = tokens[i + 2].casefold()
-
-                if table_name.casefold() in (
-                    "sqlite_schema".casefold(),
-                    "sqlite_master".casefold(),
-                    "sqlite_temp_schema".casefold(),
-                    "sqlite_temp_master".casefold(),
-                ):
-                    table_info = SqliteSchema(
-                        0,
-                        "table",
-                        "sqlite_schema",
-                        "sqlite_schema",
-                        1,
-                        "CREATE TABLE sqlite_schema (\n"
-                        "  type text,\n"
-                        "  name text,\n"
-                        "  tbl_name text,\n"
-                        "  rootpage integer,\n"
-                        "  sql text\n"
-                        ");",
-                    )
-                else:
-                    # FIXME: be more efficient
-                    try:
-                        table_info = next(
-                            table_info
-                            for table_info in select_all_from_sqlite_schema(
-                                database_file, page_size, text_encoding
-                            )
-                            if table_info.type == "table"
-                            and table_info.tbl_name.casefold() == table_name
-                        )
-                    except StopIteration:
-                        print(f"Unknown table '{table_name}'", file=sys.stderr)
-                        return 1
-
-                page = get_page(database_file, table_info.rootpage, page_size)
-                btree_header, bytes_read = parse_btree_header(
-                    page, table_info.rootpage == 1
+            table_name = stmt.from_table
+            if table_name.casefold() in (
+                "sqlite_schema".casefold(),
+                "sqlite_master".casefold(),
+                "sqlite_temp_schema".casefold(),
+                "sqlite_temp_master".casefold(),
+            ):
+                table_info = SqliteSchema(
+                    0,
+                    "table",
+                    "sqlite_schema",
+                    "sqlite_schema",
+                    1,
+                    "CREATE TABLE sqlite_schema (\n"
+                    "  type text,\n"
+                    "  name text,\n"
+                    "  tbl_name text,\n"
+                    "  rootpage integer,\n"
+                    "  sql text\n"
+                    ");",
                 )
-
-                if len(selects) == 1 and selects[0] == "count(*)".casefold():
-                    print(btree_header.cell_count)
-                else:
-                    columns = [
-                        tuple(column_spec.strip().split(None, 1))
-                        for column_spec in (
-                            table_info.sql.split("(", 1)[1].rsplit(")", 1)[0].split(",")
+            else:
+                # FIXME: be more efficient
+                try:
+                    table_info = next(
+                        table_info
+                        for table_info in select_all_from_sqlite_schema(
+                            database_file, page_size, text_encoding
                         )
-                    ]
-                    column_order = {
-                        name.casefold(): i for i, (name, _type) in enumerate(columns)
-                    }
+                        if table_info.type == "table"
+                        and table_info.tbl_name.casefold() == table_name.casefold()
+                    )
+                except StopIteration:
+                    print(f"Unknown table '{table_name}'", file=sys.stderr)
+                    return 1
 
-                    try:
-                        if "*" in selects:
-                            selected_columns = list(range(len(column_order)))
-                        else:
-                            selected_columns = [
-                                column_order[name.casefold()]
-                                for name in selects
-                            ]
+            page = get_page(database_file, table_info.rootpage, page_size)
+            btree_header, bytes_read = parse_btree_header(
+                page, table_info.rootpage == 1
+            )
 
-                        primary_key_selected_column_idx = next(
-                            (
-                                selection_index
-                                for selection_index, column_index in enumerate(selected_columns)
-                                if columns[column_index][1].casefold().split()[:3]
-                                == [
-                                    "integer".casefold(),
-                                    "primary".casefold(),
-                                    "key".casefold(),
-                                ]
-                            ),
-                            None,
-                        )
-                    except KeyError as e:
-                        print(f"Unknown column {e}", file=sys.stderr)
-                        return 1
+            if (
+                len(stmt.selects) == 1
+                and isinstance(stmt.selects[0], parser.FunctionExpr)
+                and stmt.selects[0].name == "COUNT"
+                and len(stmt.selects[0].args) == 1
+                and isinstance(stmt.selects[0].args[0], parser.StarExpr)
+            ):
+                print(btree_header.cell_count)
+            else:
+                columns = [
+                    tuple(column_spec.strip().split(None, 1))
+                    for column_spec in (
+                        table_info.sql.split("(", 1)[1].rsplit(")", 1)[0].split(",")
+                    )
+                ]
+                column_order = {
+                    name.casefold(): i for i, (name, _type) in enumerate(columns)
+                }
 
-                    for rowid, column_values in read_table(
-                        database_file,
-                        table_info.rootpage,
-                        page_size,
-                        text_encoding,
-                        selected_columns,
+                try:
+                    if len(stmt.selects) == 1 and isinstance(
+                        stmt.selects[0], parser.StarExpr
                     ):
-                        if primary_key_selected_column_idx is not None:
-                            column_values[primary_key_selected_column_idx] = rowid
-                        print("|".join(str(val) for val in column_values))
+                        selected_columns = list(range(len(column_order)))
+                    elif not all(
+                        isinstance(select, parser.NameExpr) for select in stmt.selects
+                    ):
+                        print("Only simple queries are supported", file=sys.stderr)
+                        return 1
+                    else:
+                        selected_columns = [
+                            column_order[name_expr.name.casefold()]
+                            for name_expr in stmt.selects
+                        ]
+
+                    primary_key_selected_column_idx = next(
+                        (
+                            selection_index
+                            for selection_index, column_index in enumerate(
+                                selected_columns
+                            )
+                            if columns[column_index][1].casefold().split()[:3]
+                            == [
+                                "integer".casefold(),
+                                "primary".casefold(),
+                                "key".casefold(),
+                            ]
+                        ),
+                        None,
+                    )
+                except KeyError as e:
+                    print(f"Unknown column {e}", file=sys.stderr)
+                    return 1
+
+                for rowid, column_values in read_table(
+                    database_file,
+                    table_info.rootpage,
+                    page_size,
+                    text_encoding,
+                    selected_columns,
+                ):
+                    if primary_key_selected_column_idx is not None:
+                        column_values[primary_key_selected_column_idx] = rowid
+                    print("|".join(str(val) for val in column_values))
 
     return 0
 
