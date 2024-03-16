@@ -13,12 +13,21 @@ def main():
         database_file.seek(16)  # Skip the first 16 bytes of the header
         page_size = int.from_bytes(database_file.read(2), byteorder="big")
 
+        database_file.seek(20)
+        page_reserved_space_size = int.from_bytes(
+            database_file.read(1), byteorder="big"
+        )
+
         database_file.seek(56)
         text_encoding = ["utf-8", "utf-16-le", "utf-16-be"][
             int.from_bytes(database_file.read(4), byteorder="big") - 1
         ]
 
-        db_config = DBConfig(page_size=page_size, text_encoding=text_encoding)
+        db_config = DBConfig(
+            page_size=page_size,
+            text_encoding=text_encoding,
+            page_reserved=page_reserved_space_size,
+        )
 
         if command == ".dbinfo":
             print(f"database page size: {page_size}")
@@ -32,9 +41,7 @@ def main():
             print(
                 " ".join(
                     row.tbl_name
-                    for row in select_all_from_sqlite_schema(
-                        database_file, db_config
-                    )
+                    for row in select_all_from_sqlite_schema(database_file, db_config)
                     if row.type == "table" and not row.tbl_name.startswith("sqlite_")
                 )
             )
@@ -65,43 +72,48 @@ def main():
                     "  sql text\n"
                     ");",
                 )
+                indexes = []
             else:
                 # FIXME: be more efficient
-                try:
-                    table_schema = next(
-                        table_info
-                        for table_info in select_all_from_sqlite_schema(
-                            database_file, db_config
-                        )
-                        if table_info.type == "table"
-                        and table_info.tbl_name.casefold() == table_name.casefold()
-                    )
-                except StopIteration:
+                table_schema = None
+                indexes = []
+                for sqlite_schema in select_all_from_sqlite_schema(
+                    database_file, db_config
+                ):
+                    if sqlite_schema.tbl_name.casefold() != table_name.casefold():
+                        continue
+                    elif sqlite_schema.type == "table":
+                        table_schema = sqlite_schema
+                    elif sqlite_schema.type == "index":
+                        indexes.append(sqlite_schema)
+
+                if table_schema is None:
                     print(f"Unknown table '{table_name}'", file=sys.stderr)
                     return 1
-
-            page = get_page(database_file, db_config, table_schema.rootpage)
-            btree_header, bytes_read = parse_btree_header(
-                page, table_schema.rootpage == 1
-            )
 
             create_table_ast = next(parser.parse(table_schema.sql))
             assert isinstance(create_table_ast, parser.CreateTableStmt)
 
             column_order = {
-                name.casefold(): i for i, (name, _type) in enumerate(create_table_ast.columns)
+                name.casefold(): i
+                for i, (name, _type) in enumerate(create_table_ast.columns)
             }
+            column_order["rowid".casefold()] = ROWID_COL_IDX
 
             primary_key_column_idx = next(
                 (
                     column_index
                     for column_index, column in enumerate(create_table_ast.columns)
-                    if column.type.casefold().startswith("integer primary key".casefold())
+                    if column.type.casefold().startswith(
+                        "integer primary key".casefold()
+                    )
                 ),
                 None,
             )
 
-            table_info = TableInfo(rootpage=table_schema.rootpage, int_pk_column=primary_key_column_idx)
+            table_info = TableInfo(
+                rootpage=table_schema.rootpage, int_pk_column=primary_key_column_idx
+            )
 
             is_count_star = (
                 len(stmt.selects) == 1
@@ -134,9 +146,34 @@ def main():
 
             where = None
             if stmt.where:
-                where = (
-                    column_order[stmt.where.lhs.name.casefold()],
-                    stmt.where.rhs.text,
+                # TODO: find ideal index. For each alternation of the WHERE
+                # clause, find an index that can be used (if any). From there
+                # use some heuristics to decide which index would be most
+                # effective and use that one.
+                filter_column_name = stmt.where.lhs.name
+
+                for index_schema in indexes:
+                    create_index = next(parser.parse(index_schema.sql))
+                    assert isinstance(
+                        create_index, parser.CreateIndexStmt
+                    ), create_index
+                    if (
+                        create_index.columns[0].text.casefold()
+                        == filter_column_name.casefold()
+                    ):
+                        break
+                else:
+                    index_schema = None
+
+                index_rootpage = index_schema.rootpage if index_schema else None
+
+                where = Where(
+                    BinOp(
+                        "=",
+                        column_order[filter_column_name.casefold()],
+                        stmt.where.rhs.text,
+                    ),
+                    index_rootpage,
                 )
 
             rows = read_table(
@@ -247,7 +284,9 @@ def parse_record(db_config, table_info, page, rowid, offset, selection, where):
 
     column_values: list = [None] * len(column_selection)
     for column_id, (column_serial_type, size) in enumerate(column_types):
-        if column_id not in column_selection and (not where or column_id != where[0]):
+        if column_id not in column_selection and (
+            not where or column_id != where.condition.lhs
+        ):
             offset += size
             continue
 
@@ -287,7 +326,7 @@ def parse_record(db_config, table_info, page, rowid, offset, selection, where):
 
         offset += size
 
-        if where and column_id == where[0] and value != where[1]:
+        if where and column_id == where.condition.lhs and value != where.condition.rhs:
             return None, total_size
 
         if column_id in column_selection:
@@ -296,8 +335,11 @@ def parse_record(db_config, table_info, page, rowid, offset, selection, where):
     return column_values, offset - initial_offset
 
 
-DBConfig = namedtuple("DBConfig", "page_size,text_encoding")
+DBConfig = namedtuple("DBConfig", "page_size,text_encoding,page_reserved")
 TableInfo = namedtuple("TableInfo", "rootpage,int_pk_column")
+BinOp = namedtuple("BinOp", "op,lhs,rhs")
+Where = namedtuple("Where", "condition,index_rootpage")
+ROWID_COL_IDX = -1
 
 
 def get_page(file, db_config, id_):
@@ -306,25 +348,43 @@ def get_page(file, db_config, id_):
 
 
 def read_table(file, db_config, table_info, selection, where):
-    page = get_page(file, db_config, table_info.rootpage)
-    yield from _read_table(file, db_config, table_info, page, selection, where)
+    if where and where.index_rootpage:
+        matching_ids = list(
+            _read_index(file, db_config, table_info, where.index_rootpage, where)
+        )
+        page = get_page(file, db_config, table_info.rootpage)
+        yield from _read_table_by_id(
+            file,
+            db_config,
+            table_info,
+            page,
+            selection,
+            (min(matching_ids), max(matching_ids)),
+            set(matching_ids),
+        )
+    else:
+        page = get_page(file, db_config, table_info.rootpage)
+        yield from _read_table(file, db_config, table_info, page, selection, where)
 
 
 def _read_table(file, db_config, table_info, page, selection, where):
-    btree_header, bytes_read = parse_btree_header(page, is_first_page=table_info.rootpage == 1)
+    btree_header, bytes_read = parse_btree_header(
+        page, is_first_page=table_info.rootpage == 1
+    )
 
     btree_offset = bytes_read
     if table_info.rootpage == 1:
         btree_offset += 100
 
-    for _i in range(btree_header.cell_count):
-        (cell_content_offset,) = struct.unpack_from(">H", page, btree_offset)
-        btree_offset += 2
+    for i in range(btree_header.cell_count):
+        (cell_content_offset,) = struct.unpack_from(">H", page, btree_offset + 2 * i)
 
         if btree_header.type == BTREE_PAGE_INTERIOR_TABLE:
             (left_ptr,) = struct.unpack_from(">I", page, cell_content_offset)
             left_page = get_page(file, db_config, left_ptr)
-            yield from _read_table(file, db_config, table_info, left_page, selection, where)
+            yield from _read_table(
+                file, db_config, table_info, left_page, selection, where
+            )
         else:
             assert btree_header.type == BTREE_PAGE_LEAF_TABLE
             payload_size, bytes_read = parse_varint(page, cell_content_offset)
@@ -333,10 +393,24 @@ def _read_table(file, db_config, table_info, page, selection, where):
             rowid, bytes_read = parse_varint(page, cell_content_offset)
             cell_content_offset += bytes_read
 
-            column_values, bytes_read = parse_record(
-                db_config, table_info, page, rowid, cell_content_offset, selection, where
-            )
-            assert bytes_read == payload_size, (bytes_read, payload_size)
+            if (
+                where
+                and where.condition.op == "="
+                and where.condition.lhs == ROWID_COL_IDX
+                and rowid != where.condition.rhs
+            ):
+                column_values = None
+            else:
+                column_values, bytes_read = parse_record(
+                    db_config,
+                    table_info,
+                    page,
+                    rowid,
+                    cell_content_offset,
+                    selection,
+                    where,
+                )
+                assert bytes_read == payload_size, (bytes_read, payload_size)
 
             # filtered out
             if column_values is None:
@@ -346,7 +420,143 @@ def _read_table(file, db_config, table_info, page, selection, where):
 
     if btree_header.type == BTREE_PAGE_INTERIOR_TABLE:
         rightmost_page = get_page(file, db_config, btree_header.rightmost_pointer)
-        yield from _read_table(file, db_config, table_info, rightmost_page, selection, where)
+        yield from _read_table(
+            file, db_config, table_info, rightmost_page, selection, where
+        )
+
+
+def _read_index(file, db_config, table_info, page_id, where):
+    page = get_page(file, db_config, page_id)
+    btree_header, cell_array_offset = parse_btree_header(page)
+    is_leaf = btree_header.type == BTREE_PAGE_LEAF_INDEX
+    assert is_leaf or btree_header.type == BTREE_PAGE_INTERIOR_INDEX
+
+    def _read_key(cell_content_offset):
+        if not is_leaf:
+            (left_pointer,) = struct.unpack_from(">I", page, cell_content_offset)
+            cell_content_offset += 4
+        else:
+            left_pointer = None
+
+        payload_size, bytes_read = parse_varint(page, cell_content_offset)
+        cell_content_offset += bytes_read
+        index_data, bytes_read = parse_record(
+            db_config, table_info, page, None, cell_content_offset, [0, 1], None
+        )
+        assert bytes_read == payload_size
+        assert index_data is not None
+        return index_data, left_pointer
+
+    L = 0
+    R = btree_header.cell_count
+    while L < R:
+        i = (L + R) // 2
+
+        (cell_content_offset,) = struct.unpack_from(
+            ">H", page, cell_array_offset + 2 * i
+        )
+        index_data, left_pointer = _read_key(cell_content_offset)
+
+        if index_data[0] < where.condition.rhs:
+            L = i + 1
+        else:
+            R = i
+
+    for i in range(L, btree_header.cell_count):
+        (cell_content_offset,) = struct.unpack_from(
+            ">H", page, cell_array_offset + 2 * i
+        )
+        index_data, left_pointer = _read_key(cell_content_offset)
+
+        if not is_leaf:
+            assert left_pointer is not None
+            yield from _read_index(file, db_config, table_info, left_pointer, where)
+
+        if index_data[0] == where.condition.rhs:
+            yield index_data[1]
+
+        if index_data[0] > where.condition.rhs:
+            break
+    else:
+        if not is_leaf:
+            yield from _read_index(
+                file, db_config, table_info, btree_header.rightmost_pointer, where
+            )
+
+
+def _read_table_by_id(file, db_config, table_info, page, selection, id_range, ids):
+    btree_header, bytes_read = parse_btree_header(
+        page, is_first_page=table_info.rootpage == 1
+    )
+    is_leaf = btree_header.type == BTREE_PAGE_LEAF_TABLE
+    assert is_leaf or btree_header.type == BTREE_PAGE_INTERIOR_TABLE
+
+    btree_offset = bytes_read
+    if table_info.rootpage == 1:
+        btree_offset += 100
+
+    L = 0
+    R = btree_header.cell_count
+    while L < R:
+        i = (L + R) // 2
+
+        (cell_content_offset,) = struct.unpack_from(">H", page, btree_offset + 2 * i)
+
+        if is_leaf:
+            _payload_size, bytes_read = parse_varint(page, cell_content_offset)
+            cell_content_offset += bytes_read
+            rowid, bytes_read = parse_varint(page, cell_content_offset)
+            cell_content_offset += bytes_read
+        else:
+            rowid, bytes_read = parse_varint(page, cell_content_offset + 4)
+
+        if rowid < id_range[0]:
+            L = i + 1
+        else:
+            R = i
+
+    for i in range(L, btree_header.cell_count):
+        (cell_content_offset,) = struct.unpack_from(">H", page, btree_offset + 2 * i)
+
+        if not is_leaf:
+            (left_ptr,) = struct.unpack_from(">I", page, cell_content_offset)
+            left_page = get_page(file, db_config, left_ptr)
+            yield from _read_table_by_id(
+                file, db_config, table_info, left_page, selection, id_range, ids
+            )
+        else:
+            payload_size, bytes_read = parse_varint(page, cell_content_offset)
+            cell_content_offset += bytes_read
+
+            rowid, bytes_read = parse_varint(page, cell_content_offset)
+            cell_content_offset += bytes_read
+
+            if rowid not in ids:
+                column_values = None
+            else:
+                column_values, bytes_read = parse_record(
+                    db_config,
+                    table_info,
+                    page,
+                    rowid,
+                    cell_content_offset,
+                    selection,
+                    None,
+                )
+                assert bytes_read == payload_size, (bytes_read, payload_size)
+
+            # filtered out
+            if column_values is not None:
+                yield column_values
+
+            if rowid >= id_range[1]:
+                break
+    else:
+        if not is_leaf:
+            rightmost_page = get_page(file, db_config, btree_header.rightmost_pointer)
+            yield from _read_table_by_id(
+                file, db_config, table_info, rightmost_page, selection, id_range, ids
+            )
 
 
 SqliteSchema = namedtuple(

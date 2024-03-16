@@ -48,6 +48,8 @@ _keywords = {
     "WHERE".casefold(): "WHERE",
     "CREATE".casefold(): "CREATE",
     "TABLE".casefold(): "TABLE",
+    "INDEX".casefold(): "INDEX",
+    "ON".casefold(): "ON",
 }
 
 
@@ -83,7 +85,7 @@ def _scan(it):
                         break
                 else:
                     str_content += c
-            yield Token("STRING", str_content)
+            yield Token("STRING" if c == "'" else "NAME", str_content)
         else:
             raise ParseError(f"Unexpected token {c!r}")
 
@@ -104,6 +106,7 @@ def parse(text):
 
 SelectStmt = namedtuple("SelectStmt", "selects,from_table,where")
 CreateTableStmt = namedtuple("CreateTableStmt", "name,columns")
+CreateIndexStmt = namedtuple("CreateIndexStmt", "name,table_name,columns")
 CreateTableField = namedtuple("CreateTableField", "name,type")
 FunctionExpr = namedtuple("FunctionExpr", "name,args")
 NameExpr = namedtuple("NameExpr", "name")
@@ -116,7 +119,7 @@ def _parse(it):
     if it.peek() and it.peek().type == "SELECT":
         yield _parse_select_stmt(it)
     elif it.peek() and it.peek().type == "CREATE":
-        yield _parse_create_table(it)
+        yield _parse_create(it)
     else:
         raise ParseError(f"Unexpected token {it.peek()!r}")
 
@@ -189,17 +192,25 @@ def _parse_selection(it):
     return FunctionExpr(name.text.upper(), args)
 
 
-def _parse_create_table(it):
+def _parse_create(it):
     _expect(it, "CREATE")
+
+    next_ = it.peek()
+    if not next_:
+        raise ParseError("Unexpected end of input in create statement")
+
+    if next_.type == "TABLE":
+        return _parse_create_table(it)
+    elif next_.type == "INDEX":
+        return _parse_create_index(it)
+    else:
+        raise ParseError(f"Unexpected {next_!r} in create statement")
+
+
+def _parse_create_table(it):
     _expect(it, "TABLE")
 
-    name = next(it, None)
-    if name is None:
-        raise ParseError("Unexpected end of input, expected table name")
-    elif name.type not in ("NAME", "STRING"):
-        raise ParseError(f"Expected table name to be string or name, got {name.text!r}")
-
-    table_name = name.text
+    table_name = _expect(it, "NAME").text
 
     _expect(it, "LPAREN")
     columns = []
@@ -223,3 +234,31 @@ def _parse_create_table(it):
         raise ParseError(f"Expected end of input or semicolon, got {tok.text!r}")
 
     return CreateTableStmt(table_name, tuple(columns))
+
+
+def _parse_create_index(it):
+    _expect(it, "INDEX")
+
+    index_name = _expect(it, "NAME").text
+
+    _expect(it, "ON")
+
+    table_name = _expect(it, "NAME").text
+
+    _expect(it, "LPAREN")
+    columns = []
+    first = True
+    while it.peek() and it.peek().type != "RPAREN":
+        if first:
+            first = False
+        else:
+            _expect(it, "COMMA")
+        columns.append(_expect(it, "NAME"))
+
+    _expect(it, "RPAREN")
+
+    tok = next(it, None)
+    if tok and tok.type != "SEMICOLON":
+        raise ParseError(f"Expected end of input or semicolon, got {tok.text!r}")
+
+    return CreateIndexStmt(index_name, table_name, tuple(columns))
